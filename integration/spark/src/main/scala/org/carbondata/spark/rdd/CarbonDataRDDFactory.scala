@@ -21,16 +21,20 @@ package org.carbondata.spark.rdd
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ListBuffer
 
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.io.{LongWritable, Text}
-import org.apache.spark.{Logging, SparkContext}
-import org.apache.spark.rdd.{DummyLoadRDD, NewHadoopRDD}
+import org.apache.commons.lang.ArrayUtils
+import org.apache.hadoop.conf.{Configurable, Configuration}
+import org.apache.hadoop.io.{LongWritable, Text, Writable}
+import org.apache.hadoop.mapreduce.{InputSplit, Job}
+import org.apache.hadoop.mapreduce.lib.input.FileSplit
+import org.apache.spark.{Logging, Partition, SparkContext}
+import org.apache.spark.rdd.{DummyLoadRDD, NewHadoopPartition, NewHadoopRDD}
 import org.apache.spark.sql.{CarbonEnv, CarbonRelation, SQLContext}
 import org.apache.spark.sql.execution.command.Partitioner
 import org.apache.spark.util.{FileUtils, SplitUtils}
 
 import org.carbondata.common.logging.LogServiceFactory
 import org.carbondata.core.carbon.{AbsoluteTableIdentifier, CarbonDataLoadSchema, CarbonTableIdentifier}
+import org.carbondata.core.carbon.datastore.block.TableBlockInfo
 import org.carbondata.core.carbon.metadata.CarbonMetadata
 import org.carbondata.core.carbon.metadata.schema.table.CarbonTable
 import org.carbondata.core.constants.CarbonCommonConstants
@@ -379,14 +383,35 @@ object CarbonDataRDDFactory extends Logging {
           val filePaths = FileUtils.getPaths(carbonLoadModel.getFactFilePath)
           hadoopConfiguration.set("mapreduce.input.fileinputformat.inputdir", filePaths)
           hadoopConfiguration.set("mapreduce.input.fileinputformat.input.dir.recursive", "true")
-          val newHadoopRDD = new NewHadoopRDD[LongWritable, Text](
-            sc.sparkContext,
-            classOf[org.apache.hadoop.mapreduce.lib.input.TextInputFormat],
-            classOf[LongWritable],
-            classOf[Text],
-            hadoopConfiguration)
-          blocksGroupBy = new DummyLoadRDD(newHadoopRDD).collect().groupBy[String](_._1)
-            .map { iter => (iter._1, iter._2.map(_._2)) }.toArray
+
+          val inputFormat = new org.apache.hadoop.mapreduce.lib.input.TextInputFormat
+          inputFormat match {
+            case configurable: Configurable =>
+              configurable.setConf(hadoopConfiguration)
+            case _ =>
+          }
+          val jobContext = new Job(hadoopConfiguration)
+          val rawSplits = inputFormat.getSplits(jobContext).toArray
+          val result = new Array[Partition](rawSplits.size)
+          val blockList = rawSplits.map(inputSplit => {
+            val fileSplit = inputSplit.asInstanceOf[FileSplit]
+            new TableBlockInfo(fileSplit.getPath.toString,
+              fileSplit.getStart, -1,
+              fileSplit.getLocations, fileSplit.getLength
+            )
+          }
+          )
+          // group blocks to nodes, tasks
+          val nodeBlockMapping =
+            CarbonLoaderUtil.nodeBlockMapping(blockList.toSeq.asJava, -1).asScala.toSeq
+
+          blocksGroupBy = nodeBlockMapping.map( entry => {
+              val blockDetailsList =
+                entry._2.asScala.map( tableBlock =>
+                  new BlockDetails(tableBlock.getFilePath,
+                    tableBlock.getBlockOffset, tableBlock.getBlockLength)).toArray
+              (entry._1, blockDetailsList)
+            }).toArray
       }
       CarbonLoaderUtil.checkAndCreateCarbonDataLocation(hdfsStoreLocation,
         carbonLoadModel.getDatabaseName, carbonLoadModel.getTableName,

@@ -56,10 +56,8 @@ class DummyLoadRDD(prev: NewHadoopRDD[LongWritable, Text])
       override def next(): (String, BlockDetails) = {
         val host = TaskContext.get.taskMetrics.hostname
         val fileSplit = split.serializableHadoopSplit.value.asInstanceOf[FileSplit]
-        val nodeBlocksDetail = new BlockDetails
-        nodeBlocksDetail.setBlockOffset(fileSplit.getStart)
-        nodeBlocksDetail.setBlockLength(fileSplit.getLength)
-        nodeBlocksDetail.setFilePath(fileSplit.getPath.toString)
+        val nodeBlocksDetail = new BlockDetails(fileSplit.getPath.toString,
+          fileSplit.getStart, fileSplit.getLength )
         (host, nodeBlocksDetail)
       }
     }
