@@ -21,13 +21,10 @@ package org.carbondata.spark.rdd
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ListBuffer
 
-import org.apache.commons.lang.ArrayUtils
 import org.apache.hadoop.conf.{Configurable, Configuration}
-import org.apache.hadoop.io.{LongWritable, Text, Writable}
-import org.apache.hadoop.mapreduce.{InputSplit, Job}
+import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.mapreduce.lib.input.FileSplit
 import org.apache.spark.{Logging, Partition, SparkContext}
-import org.apache.spark.rdd.{DummyLoadRDD, NewHadoopPartition, NewHadoopRDD}
 import org.apache.spark.sql.{CarbonEnv, CarbonRelation, SQLContext}
 import org.apache.spark.sql.execution.command.Partitioner
 import org.apache.spark.util.{FileUtils, SplitUtils}
@@ -383,6 +380,26 @@ object CarbonDataRDDFactory extends Logging {
           val filePaths = FileUtils.getPaths(carbonLoadModel.getFactFilePath)
           hadoopConfiguration.set("mapreduce.input.fileinputformat.inputdir", filePaths)
           hadoopConfiguration.set("mapreduce.input.fileinputformat.input.dir.recursive", "true")
+          val defaultParallelism =
+            if (sc.sparkContext.defaultParallelism < 1) 1 else sc.sparkContext.defaultParallelism
+          val spaceConsumed = FileUtils.getSpaceOccupied(filePaths)
+          val blockSize =
+            hadoopConfiguration.getLong("dfs.blocksize", CarbonCommonConstants.CARBON_256MB)
+          logInfo("[Block Distribution]")
+          // calculate new block size to allow use all the parallelism
+          if (spaceConsumed < defaultParallelism * blockSize) {
+            var newSplitSize: Long = spaceConsumed / defaultParallelism
+            if (newSplitSize < CarbonCommonConstants.CARBON_16MB) {
+              newSplitSize = CarbonCommonConstants.CARBON_16MB
+            }
+            hadoopConfiguration.set(
+              "mapreduce.input.fileinputformat.split.maxsize", newSplitSize.toString
+            )
+            logInfo("totalInputSpaceConsumed : " + spaceConsumed +
+              " , defaultParallelism : " + defaultParallelism
+            )
+            logInfo("mapreduce.input.fileinputformat.split.maxsize : " + newSplitSize.toString)
+          }
 
           val inputFormat = new org.apache.hadoop.mapreduce.lib.input.TextInputFormat
           inputFormat match {
@@ -396,7 +413,7 @@ object CarbonDataRDDFactory extends Logging {
           val blockList = rawSplits.map(inputSplit => {
             val fileSplit = inputSplit.asInstanceOf[FileSplit]
             new TableBlockInfo(fileSplit.getPath.toString,
-              fileSplit.getStart, -1,
+              fileSplit.getStart, 1,
               fileSplit.getLocations, fileSplit.getLength
             )
           }
@@ -404,23 +421,47 @@ object CarbonDataRDDFactory extends Logging {
           // group blocks to nodes, tasks
           val nodeBlockMapping =
             CarbonLoaderUtil.nodeBlockMapping(blockList.toSeq.asJava, -1).asScala.toSeq
-
-          blocksGroupBy = nodeBlockMapping.map( entry => {
-              val blockDetailsList =
-                entry._2.asScala.map( tableBlock =>
-                  new BlockDetails(tableBlock.getFilePath,
-                    tableBlock.getBlockOffset, tableBlock.getBlockLength)).toArray
-              (entry._1, blockDetailsList)
-            }).toArray
+          logInfo("Total no of blocks : " + blockList.size
+            + ", No.of Nodes : " + nodeBlockMapping.size
+          )
+          var str = ""
+          nodeBlockMapping.foreach(entry => {
+            val tableBlock = entry._2
+            str = str + "#Node: " + entry._1 + " no.of.blocks: " + tableBlock.size()
+            tableBlock.asScala.foreach(tableBlockInfo =>
+              if (!tableBlockInfo.getLocations.exists(hostentry =>
+                hostentry.equalsIgnoreCase(entry._1)
+              )) {
+                str = str + " , mismatch locations: " + tableBlockInfo.getLocations
+                  .foldLeft("")((a, b) => a + "," + b)
+              }
+            )
+            str = str + "\n"
+          }
+          )
+          logInfo(str)
+          blocksGroupBy = nodeBlockMapping.map(entry => {
+            val blockDetailsList =
+              entry._2.asScala.map(tableBlock =>
+                new BlockDetails(tableBlock.getFilePath,
+                  tableBlock.getBlockOffset, tableBlock.getBlockLength
+                )
+              ).toArray
+            (entry._1, blockDetailsList)
+          }
+          ).toArray
       }
+
       CarbonLoaderUtil.checkAndCreateCarbonDataLocation(hdfsStoreLocation,
         carbonLoadModel.getDatabaseName, carbonLoadModel.getTableName,
-        partitioner.partitionCount, currentLoadCount)
+        partitioner.partitionCount, currentLoadCount
+      )
       val status = new
           CarbonDataLoadRDD(sc.sparkContext, new ResultImpl(), carbonLoadModel, storeLocation,
             hdfsStoreLocation, kettleHomePath, partitioner, columinar, currentRestructNumber,
             currentLoadCount, cubeCreationTime, schemaLastUpdatedTime, blocksGroupBy,
-            isTableSplitPartition).collect()
+            isTableSplitPartition
+          ).collect()
       val newStatusMap = scala.collection.mutable.Map.empty[String, String]
       status.foreach { eachLoadStatus =>
         val state = newStatusMap.get(eachLoadStatus._2.getPartitionCount)
@@ -441,13 +482,13 @@ object CarbonDataRDDFactory extends Logging {
           if (value == CarbonCommonConstants.STORE_LOADSTATUS_FAILURE) {
             loadStatus = CarbonCommonConstants.STORE_LOADSTATUS_FAILURE
           } else if (value == CarbonCommonConstants.STORE_LOADSTATUS_PARTIAL_SUCCESS &&
-                     !loadStatus.equals(CarbonCommonConstants.STORE_LOADSTATUS_FAILURE)) {
+            !loadStatus.equals(CarbonCommonConstants.STORE_LOADSTATUS_FAILURE)) {
             loadStatus = CarbonCommonConstants.STORE_LOADSTATUS_PARTIAL_SUCCESS
           }
       }
 
       if (loadStatus != CarbonCommonConstants.STORE_LOADSTATUS_FAILURE &&
-          partitionStatus == CarbonCommonConstants.STORE_LOADSTATUS_PARTIAL_SUCCESS) {
+        partitionStatus == CarbonCommonConstants.STORE_LOADSTATUS_PARTIAL_SUCCESS) {
         loadStatus = partitionStatus
       }
 
